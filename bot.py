@@ -84,9 +84,22 @@ Return this exact structure (array even if only one bet):
 Important rules:
 - bet_type must be exactly one of: straight, parlay, teaser
 - result should reflect what the slip shows (win/loss/push) or "pending" if unsettled
-- external_id: look for any alphanumeric ID code printed on the slip (often in small text at the bottom). Extract it exactly as shown.
+- external_id: look for any alphanumeric ID code printed on the slip. Extract it exactly as shown.
 - If any field cannot be determined, use null for that field.
-- Always return a JSON array, even for a single bet."""
+- Always return a JSON array, even for a single bet.
+- Never log a bet with $0.00 as the stake.
+
+IMPORTANT - Bovada format: Bovada shows two entries per bet in transaction history:
+1. A PLACED entry showing the stake as a negative amount (e.g. -$8.00)
+2. A WIN/LOSS entry showing $0.00 for losses or the payout amount for wins
+
+When you see this Bovada pattern on screen:
+- For LOSS entries showing $0.00 amount: find the corresponding PLACED entry on the same screen to get the real stake. Set result="loss" and stake=that PLACED amount (as a positive number).
+- For WIN entries: use the amount shown as payout. Find the PLACED entry for the stake amount.
+- Only log ONE bet per PLACED+LOSS/WIN pair, not two separate entries.
+- If you only see the LOSS entry with $0.00 and no PLACED entry visible, set stake=null rather than 0.
+
+William Hill format: Shows the bet slip directly with Cash Wagered and Paid amounts. Use Cash Wagered as stake and Paid as payout."""
 
     response = ai.messages.create(
         model="claude-sonnet-4-6",
@@ -149,6 +162,12 @@ async def on_message(message):
             failed = 0
 
             for bet_data in bets_data:
+                # Skip bets with no stake
+                if not bet_data.get("stake"):
+                    skipped += 1
+                    continue
+
+                # Check for duplicates via external_id
                 external_id = bet_data.get("external_id")
                 if external_id and external_id_exists(external_id):
                     skipped += 1
@@ -181,11 +200,11 @@ async def on_message(message):
             if saved > 0:
                 parts.append(f"✅ **{saved} bet{'s' if saved > 1 else ''} logged**")
             if skipped > 0:
-                parts.append(f"⏭️ {skipped} duplicate{'s' if skipped > 1 else ''} skipped")
+                parts.append(f"⏭️ {skipped} skipped (duplicate or no stake)")
             if failed > 0:
                 parts.append(f"❌ {failed} failed to save")
 
-            await message.channel.send("\n".join(parts) if parts else "❌ No bets found in image.")
+            await message.channel.send("\n".join(parts) if parts else "❌ No valid bets found in image.")
 
     except json.JSONDecodeError:
         await message.channel.send("❌ Couldn't read the bet slip. Try a clearer screenshot.")
