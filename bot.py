@@ -55,55 +55,81 @@ def detect_image_type(img_bytes):
 
 def parse_bets_with_claude(image_b64, image_type, bettors, username):
     bettor_list = ", ".join([b["name"] for b in bettors])
-    prompt = f"""You are parsing a sports bet slip screenshot. There may be one or multiple bets visible.
+    prompt = f"""You are parsing a sports betting transaction history screenshot. Extract every completed bet and return them as a JSON array.
 
 The Discord user who posted this is: {username}
 The registered bettors in the system are: {bettor_list}
-
 Match the Discord username to the closest bettor name. If unsure, use the first bettor.
 
-Extract ALL bets visible in the image and return ONLY a valid JSON array with no extra text, markdown, or explanation.
+=== BOVADA TRANSACTION HISTORY LAYOUT ===
+Bovada's transaction history shows cards in a multi-column grid (2-3 columns side by side).
+Each bet appears as TWO separate cards that must be combined into ONE bet entry:
 
-Return this exact structure (array even if only one bet):
+CARD TYPE 1 - PLACED card (when bet was placed):
+  - Shows "PLACED" and "TO WIN $X.XX" at the top
+  - Shows the bet description (e.g. "Texas Rangers (+140)", "Over 2.5 (+122)")
+  - Shows the game/match (e.g. "Texas Rangers @ Boston Red Sox")
+  - Has Date and Time fields
+  - Amount field shows a NEGATIVE number (e.g. -$2.00, -$8.00) = the stake
+  - Total Balance field shows account balance after placing
+
+CARD TYPE 2 - RESULT card (when bet settled):
+  - Shows the bet name and result: e.g. "Texas Rangers (+140) Loss" or "Draw (+230) Loss"
+  - Shows "LOSS" or "WIN" prominently
+  - Has Date and Time fields
+  - Amount field shows $0.00 for LOSS, or a positive dollar amount for WIN (= payout received)
+  - Total Balance field shows account balance after settlement
+
+HOW TO COMBINE THEM INTO ONE BET:
+- Match a PLACED card to its RESULT card by the bet description (they describe the same bet)
+- stake = the absolute value of the negative Amount from the PLACED card (e.g. -$2.00 → stake = 2.00)
+- payout = the Amount from the WIN result card (e.g. +$2.80 → payout = 2.80). For LOSS = 0 payout.
+- result = "win" if WIN card, "loss" if LOSS card
+- bet_date = use the date from the PLACED card
+- description = the bet description (e.g. "Texas Rangers (+140) vs Boston Red Sox")
+- odds = extract from the bet name in parentheses e.g. (+140) → 140, (-115) → -115
+
+PLACED-only cards with no matching RESULT card = result is "pending"
+RESULT cards with no visible PLACED card = try to infer stake from context, or set stake=null and skip
+
+ALSO VISIBLE IN THE SCREENSHOT may be partial cards, cut-off cards, or cards from different bets.
+Carefully scan the ENTIRE image left to right, top to bottom, column by column.
+
+=== WILLIAM HILL FORMAT ===
+Shows a clean bet slip with:
+- Cash Wagered = stake
+- Paid = payout
+- Result shown as WON/LOSS badge
+
+=== OUTPUT FORMAT ===
+Return ONLY a valid JSON array, no extra text, no markdown, no explanation.
+If no valid bets can be extracted, return []
+
 [
   {{
-    "bettor_name": "matched name from the bettor list",
-    "sportsbook": "William Hill or Bovada or Other",
+    "bettor_name": "matched name from bettor list",
+    "sportsbook": "Bovada",
     "bet_type": "straight or parlay or teaser",
     "sport": "NFL or NBA or MLB or MMA or Soccer or NHL or Other",
-    "description": "brief description of the bet",
-    "odds": integer like -110 or 250 (American odds, no plus sign needed for positive),
-    "stake": number like 25.00,
-    "payout": number like 47.50,
+    "description": "brief description e.g. Texas Rangers +140 vs Boston Red Sox",
+    "odds": integer e.g. 140 or -115 (no plus sign needed for positive),
+    "stake": number e.g. 2.00,
+    "payout": number e.g. 2.80 (0 or null for losses),
     "result": "win or loss or push or pending",
-    "bet_date": "{date.today().isoformat()}",
-    "external_id": "the bet ID shown on the slip if visible, otherwise null"
+    "bet_date": "YYYY-MM-DD from the PLACED card date",
+    "external_id": null
   }}
 ]
 
-Important rules:
-- bet_type must be exactly one of: straight, parlay, teaser
-- result should reflect what the slip shows (win/loss/push) or "pending" if unsettled
-- external_id: look for any alphanumeric ID code printed on the slip. Extract it exactly as shown.
-- If any field cannot be determined, use null for that field.
-- Always return a JSON array, even for a single bet.
-- Never log a bet with $0.00 as the stake.
-
-IMPORTANT - Bovada format: Bovada shows two entries per bet in transaction history:
-1. A PLACED entry showing the stake as a negative amount (e.g. -$8.00)
-2. A WIN/LOSS entry showing $0.00 for losses or the payout amount for wins
-
-When you see this Bovada pattern on screen:
-- For LOSS entries showing $0.00 amount: find the corresponding PLACED entry on the same screen to get the real stake. Set result="loss" and stake=that PLACED amount (as a positive number).
-- For WIN entries: use the amount shown as payout. Find the PLACED entry for the stake amount.
-- Only log ONE bet per PLACED+LOSS/WIN pair, not two separate entries.
-- If you only see the LOSS entry with $0.00 and no PLACED entry visible, set stake=null rather than 0.
-
-William Hill format: Shows the bet slip directly with Cash Wagered and Paid amounts. Use Cash Wagered as stake and Paid as payout."""
+Rules:
+- Never include a bet with stake = 0 or stake = null (skip it)
+- bet_type is almost always "straight" unless you can clearly see it is a parlay or teaser
+- One JSON object per bet (PLACED + RESULT = one object, not two)
+- Always return an array even for one bet"""
 
     response = ai.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=1000,
+        max_tokens=2000,
         messages=[{
             "role": "user",
             "content": [
@@ -122,6 +148,12 @@ William Hill format: Shows the bet slip directly with Cash Wagered and Paid amou
 
     raw = response.content[0].text.strip()
     raw = re.sub(r"```json|```", "", raw).strip()
+
+    # Extract JSON array even if there's surrounding text
+    match = re.search(r'\[.*\]', raw, re.DOTALL)
+    if match:
+        raw = match.group(0)
+
     return json.loads(raw)
 
 @client.event
@@ -150,27 +182,36 @@ async def on_message(message):
             await message.remove_reaction("⏳", client.user)
             return
 
+        total_saved = 0
+        total_skipped = 0
+        total_failed = 0
+
         for attachment in images:
             img_bytes = await attachment.read()
             img_b64 = base64.b64encode(img_bytes).decode("utf-8")
             img_type = detect_image_type(img_bytes)
 
-            bets_data = parse_bets_with_claude(img_b64, img_type, bettors, message.author.name)
+            try:
+                bets_data = parse_bets_with_claude(img_b64, img_type, bettors, message.author.name)
+            except (json.JSONDecodeError, Exception) as e:
+                print(f"Parse error on {attachment.filename}: {e}")
+                total_failed += 1
+                continue
 
-            saved = 0
-            skipped = 0
-            failed = 0
+            if not bets_data:
+                total_skipped += 1
+                continue
 
             for bet_data in bets_data:
                 # Skip bets with no stake
                 if not bet_data.get("stake"):
-                    skipped += 1
+                    total_skipped += 1
                     continue
 
                 # Check for duplicates via external_id
                 external_id = bet_data.get("external_id")
                 if external_id and external_id_exists(external_id):
-                    skipped += 1
+                    total_skipped += 1
                     continue
 
                 bettor = next((b for b in bettors if b["name"].lower() == bet_data.get("bettor_name", "").lower()), bettors[0])
@@ -192,22 +233,23 @@ async def on_message(message):
 
                 success = insert_bet(bet_data)
                 if success:
-                    saved += 1
+                    total_saved += 1
                 else:
-                    failed += 1
+                    total_failed += 1
 
-            parts = []
-            if saved > 0:
-                parts.append(f"✅ **{saved} bet{'s' if saved > 1 else ''} logged**")
-            if skipped > 0:
-                parts.append(f"⏭️ {skipped} skipped (duplicate or no stake)")
-            if failed > 0:
-                parts.append(f"❌ {failed} failed to save")
+        parts = []
+        if total_saved > 0:
+            parts.append(f"✅ **{total_saved} bet{'s' if total_saved > 1 else ''} logged**")
+        if total_skipped > 0:
+            parts.append(f"⏭️ {total_skipped} skipped (duplicate, no stake, or unclear)")
+        if total_failed > 0:
+            parts.append(f"❌ {total_failed} image{'s' if total_failed > 1 else ''} couldn't be read — try uploading fewer bets per screenshot")
 
-            await message.channel.send("\n".join(parts) if parts else "❌ No valid bets found in image.")
+        if not parts:
+            parts.append("❌ No valid bets found — make sure the screenshot shows full bet cards including the PLACED entries")
 
-    except json.JSONDecodeError:
-        await message.channel.send("❌ Couldn't read the bet slip. Try a clearer screenshot.")
+        await message.channel.send("\n".join(parts))
+
     except Exception as e:
         print(f"Error: {e}")
         await message.channel.send("❌ Something went wrong. Please try again.")
